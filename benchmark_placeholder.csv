@@ -1,0 +1,3 @@
+Question_nr,Paper_id,Nr_data_suppl,doi,title,question,A,B,C,D,Correct,Difficulty
+1,paper1,2,10.1000/xyz123,"Example Paper 1","What is the capital of France?","Paris","London","Berlin","Madrid","A","Easy"
+2,paper2,1,10.1000/abc456,"Example Paper 2","What is the color of the sky?","Green","Blue","Red","Yellow","B","Easy"
