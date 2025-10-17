@@ -22,9 +22,9 @@ load_dotenv()
 
 from openai.lib._parsing._completions import type_to_response_format_param
 
-from src.utils.functions import format_msgs, encode_image, retrieve_colpali, response_real_out
+from functions import format_msgs, encode_image, retrieve_colpali, response_real_out
 
-BENCHMARK_FILE ="./test/Glycans_q_a_v5.xlsx"
+BENCHMARK_FILE ="./data/Glycans_q_a_v5.xlsx"
 EMBED_MODEL_ID = "BAAI/bge-base-en-v1.5"
 
 TOP_K=5
@@ -182,7 +182,12 @@ async def main():
     parser.add_argument("--vector_db", required=True, type=str)
     parser.add_argument("--type", required=True, type=str)
     #if perm_quest "Yes" order of answers will be permuted!!!
-    parser.add_argument("--perm_quest", required=False, type=str)
+    parser.add_argument(
+        "--perm_quest",
+        required=False,
+        type=str,
+        help="Set to 'yes' to randomise answer order per question.",
+    )
     args = parser.parse_args()
 
 
@@ -191,7 +196,9 @@ async def main():
     filepath_output  = args.filepath_output
     vector_db  = args.vector_db
     type= args.type
-    #perm_quest= args.perm_quest
+    permute_answers = bool(
+        args.perm_quest and args.perm_quest.lower() in ["yes", "true", "1"]
+    )
 
 
     t_start=time()
@@ -212,7 +219,7 @@ async def main():
     q_perm=[]
     for _,row in tqdm(qa_data.iterrows()):
         answers= [row['A'],row['B'],row['C'],row['D']]
-        if hasattr(args, 'perm_quest'):
+        if permute_answers:
             perm_idx= random.sample(range(len(answers)), len(answers))
 
             #rev_perm_idx=[j for _,j in sorted((e,i) for i,e in enumerate(perm_idx))]
@@ -297,12 +304,11 @@ async def main():
     eval_results = {"model": model_name, "evaluation": sorted(out_list, key=lambda x: x['Question_nr']), "elapsed_time": time() - t_start, "timestamp": timestamp }
     # for prompt, response in responses:
     #     print(f"prompt: {prompt}; response: {response}")
-    if hasattr(args, 'perm_quest'):
-        with open(filepath_output +"_" +timestamp+"_perm_q.pkl", 'wb') as file:
-            pickle.dump(eval_results, file)
-    else:        
-        with open(filepath_output +"_" +timestamp+".pkl", 'wb') as file:
-            pickle.dump(eval_results, file)
+    suffix = "_perm_q" if permute_answers else ""
+    eval_results["permuted_answers"] = permute_answers
+
+    with open(f"{filepath_output}_{timestamp}{suffix}.pkl", 'wb') as file:
+        pickle.dump(eval_results, file)
 
 
 t0 = time()

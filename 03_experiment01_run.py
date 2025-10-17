@@ -6,6 +6,9 @@ for deployed model on docker on specific port
 import argparse
 import subprocess
 import time
+from pathlib import Path
+
+EVAL_SCRIPT = "02_experiment01.py"
 
 #python run_eval_model_repeat_perm_q.py --vllm_port "8006" --model_name "Qwen/Qwen3-VL-30B-A3B-Thinking-FP8" --model_name_short "qwen3_30b_think_fp8" --vd_mm_name "MM21_qwen3_30b_think_fp8" --vd_colpali_name "COL_PALI" --vd_text_name "RAG_TEXT" --repeats "5"
 
@@ -85,31 +88,63 @@ def main():
         port="not_local"
     else:
         port = vllm_port
-    repeats  = args.repeats
+    repeats  = int(args.repeats)
+
+    eval_root = Path("./results/eval")
+    eval_root.mkdir(parents=True, exist_ok=True)
+
+    evaluation_modes = [
+        ("no_RAG", "", ""),
+        ("text_RAG", vd_text_name, "mm_RAG"),
+        ("mm_RAG", vd_mm_name, "mm_RAG"),
+        ("colpali", vd_colpali_name, "colpali"),
+    ]
+
+    perm_settings = [
+        (True, "perm"),
+        (False, "no_perm"),
+    ]
 
     t_start0=time.time()
 
-    for i in range(int(repeats)):
-        t_start=time.time()
+    for permute, perm_label in perm_settings:
+        perm_flag = ["--perm_quest", "Yes"] if permute else []
+        for i in range(repeats):
+            t_start=time.time()
+            repeat_idx = i + 1
+            for eval_label, vector_db, eval_type in evaluation_modes:
+                print(
+                    f"Processing model: {model_name}, port: {port}, "
+                    f"vd_name: {eval_label} ({vector_db or 'none'}), "
+                    f"permute_answers={permute}, repeat {repeat_idx}/{repeats}"
+                )
+                output_stub = eval_root / f"eval_{model_name_short}_{eval_label}_{perm_label}_benchmark"
+                cmd = [
+                    "python",
+                    EVAL_SCRIPT,
+                    "--vllm_port",
+                    vllm_port,
+                    "--model_name",
+                    model_name,
+                    "--filepath_output",
+                    str(output_stub),
+                    "--vector_db",
+                    vector_db,
+                    "--type",
+                    eval_type,
+                ]
+                cmd.extend(perm_flag)
+                subprocess.call(cmd)
 
-        print(f"Proocessing model: {model_name}, port: {port},  vd_name: no_RAG")
-        subprocess.call(["python", "benchmark_test_openai.py", "--vllm_port", vllm_port, "--model_name", model_name, "--filepath_output", str("./results/eval/eval_"+ model_name_short +"_no_RAG_benchmark"), "--vector_db", "", "--type", "", "--perm_quest", "Yes"])
-
-        print(f"Proocessing model: {model_name}, port: {port}, vd_name: text_RAG ({vd_text_name})")
-        subprocess.call(["python", "benchmark_test_openai.py", "--vllm_port", vllm_port, "--model_name", model_name, "--filepath_output", str("./results/eval/eval_"+ model_name_short +"_text_RAG_benchmark"), "--vector_db", vd_text_name, "--type", "mm_RAG", "--perm_quest", "Yes"])
-
-        print(f"Proocessing model: {model_name}, port: {port}, vd_name: mm_RAG ({vd_mm_name})")
-        subprocess.call(["python", "benchmark_test_openai.py", "--vllm_port", vllm_port, "--model_name", model_name, "--filepath_output", str("./results/eval/eval_"+ model_name_short +"_mm_RAG_benchmark"), "--vector_db", vd_mm_name, "--type", "mm_RAG", "--perm_quest", "Yes"])
-
-        print(f"Proocessing model: {model_name}, port: {port}, vd_name: colpali ({vd_colpali_name})")
-        subprocess.call(["python", "benchmark_test_openai.py", "--vllm_port", vllm_port, "--model_name", model_name, "--filepath_output", str("./results/eval/eval_"+ model_name_short +"_colpali_benchmark"), "--vector_db", vd_colpali_name, "--type", "colpali", "--perm_quest", "Yes"])
-
-        #python benchmark_test_openai.py --vllm_port vllm_port --model_name model_name --filepath_output str("./src/tmp_data/eval_" + model_name_short + "_mm_RAG_benchmark.pkl") --vector_db vd_mm_name --type "mm_RAG" ;
-
-        #python benchmark_test_openai.py --vllm_port vllm_port --model_name model_name --filepath_output str("./src/tmp_data/eval_" + model_name_short + "_colpali_benchmark.pkl") --vector_db vd_colpali_name --type "colpali" ;
-
-        print(f"Evaluation task for model {model_name}, {int(i)+1}/{repeats}, loop took {time.time() - t_start} seconds.")
+            print(
+                f"Evaluation loop ({perm_label}) for model {model_name}, "
+                f"repeat {repeat_idx}/{repeats} took {time.time() - t_start:.2f} seconds."
+            )
     
-    print(f"\nFull evaluation task for model {model_name} with {repeats} repeats took {time.time() - t_start0} seconds.")
+    total_loops = repeats * len(perm_settings)
+    print(
+        f"\nFull evaluation task for model {model_name} with {total_loops} "
+        f"repeats (including permutations) took {time.time() - t_start0:.2f} seconds."
+    )
 if __name__ == '__main__':
     main()
