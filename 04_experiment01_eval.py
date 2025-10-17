@@ -168,10 +168,16 @@ def main() -> None:
     )
 
     # Save full merged dataset
-    Path(args.full_path).parent.mkdir(parents=True, exist_ok=True)
-    merged.sort_values(["model_short", "vd_name", "permuted_answers", "Question_nr"]).to_excel(
-        args.full_path, index=False
-    )
+    full_parent = Path(args.full_path).parent
+    summary_parent = Path(args.summary_path).parent
+    majority_parent = Path(args.majority_path).parent
+    full_parent.mkdir(parents=True, exist_ok=True)
+    summary_parent.mkdir(parents=True, exist_ok=True)
+    majority_parent.mkdir(parents=True, exist_ok=True)
+
+    merged.sort_values(
+        ["model_short", "vd_name", "permuted_answers", "Question_nr"]
+    ).to_excel(args.full_path, index=False)
 
     # Summary accuracies by difficulty
     summary = compute_summary_tables(merged)

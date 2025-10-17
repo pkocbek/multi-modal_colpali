@@ -253,26 +253,26 @@ def data_preparation (conversion:list, vd_dir, vd_tokenizer, mm_dir="",  only_te
         filename_link = el["link"]
         documents_id= str(uuid.uuid4())
         
-        if mm_dir == "":
-            save_dir = vd_dir
-        else:
-            save_dir = mm_dir
+        save_dir = vd_dir if mm_dir == "" else mm_dir
+        save_root = Path(save_dir)
+        save_root.mkdir(parents=True, exist_ok=True)
 
-
-        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        doc_stem = Path(filename).stem
+        doc_name = el["document"].name
+        pg_image_dir = save_root / "pg_images"
         # Save page images
         if page_images:
+            pg_image_dir.mkdir(parents=True, exist_ok=True)
             for page_no, page in  el["document"].pages.items():
                 page_no = page.page_no
-                page_image_filename = (
-                    Path(save_dir) / f"pg_images/{filename.split(".")[0]}_{page_no:03d}.png"
-                )
+                page_image_filename = pg_image_dir / f"{doc_stem}_{page_no:03d}.png"
                 with page_image_filename.open("wb") as fp:
                     img = resize_image(page.image.pil_image)
                     img.save(fp, format="PNG")
 
         if not only_text:
-            Path(save_dir).mkdir(parents=True, exist_ok=True)
+            tables_dir = save_root / "tables"
+            images_dir = save_root / "images"
             # Save images of figures and tables
             table_counter = 0
             picture_counter = 0
@@ -280,10 +280,8 @@ def data_preparation (conversion:list, vd_dir, vd_tokenizer, mm_dir="",  only_te
                 if isinstance(element, TableItem):
                     table_counter += 1
                     if table_counter == 1:
-                        Path(save_dir + "/tables").mkdir(parents=True, exist_ok=True)
-                    element_image_filename = (
-                        Path(save_dir) / f"tables/{filename.split(".")[0]}_table_{table_counter:03d}.png"
-                    )
+                        tables_dir.mkdir(parents=True, exist_ok=True)
+                    element_image_filename = tables_dir / f"{doc_stem}_table_{table_counter:03d}.png"
                     with element_image_filename.open("wb") as fp:
                         img = resize_image(element.get_image(el["document"]))
                         img.save(fp, "PNG")
@@ -291,10 +289,8 @@ def data_preparation (conversion:list, vd_dir, vd_tokenizer, mm_dir="",  only_te
                 if isinstance(element, PictureItem):
                     picture_counter += 1
                     if picture_counter == 1:
-                        Path(save_dir + "/images").mkdir(parents=True, exist_ok=True)
-                    element_image_filename = (
-                        Path(save_dir) / f"images/{filename.split(".")[0]}_img_{picture_counter:03d}.png"
-                    )
+                        images_dir.mkdir(parents=True, exist_ok=True)
+                    element_image_filename = images_dir / f"{doc_stem}_img_{picture_counter:03d}.png"
                     with element_image_filename.open("wb") as fp:
                         img = resize_image(element.get_image(el["document"]))
                         img.save(fp, "PNG")
@@ -354,7 +350,7 @@ def data_preparation (conversion:list, vd_dir, vd_tokenizer, mm_dir="",  only_te
                         "page_no": table.prov[0].page_no,
                         "ref": ref,
                         "caption":caption,
-                        "img_link":f"{save_dir}tables/{el["document"].name}_table_{idx:03d}.png",      
+                        "img_link":str(tables_dir / f"{doc_name}_table_{idx:03d}.png"),
                     },
                 )
                 tables.append(document)
@@ -370,8 +366,7 @@ def data_preparation (conversion:list, vd_dir, vd_tokenizer, mm_dir="",  only_te
                 caption = RefItem(cref=picture.captions[0].cref).resolve(el["document"]).text
             except:
                 caption = ""
-            #print(f'''{ref}, caption: {caption}''')
-            link=f"{save_dir}images/{el["document"].name}_img_{idx:03d}.png"
+            link = str(images_dir / f"{doc_name}_img_{idx:03d}.png")
             #print(idx)
             text_ =[]
             for annotation in picture.annotations:
@@ -683,6 +678,7 @@ def convert_pdfs_to_images(pdf_files, save_loc):
     """Convert PDFs into a dictionary of PIL images."""
     #pdf_files = [f for f in os.listdir(pdf_folder) if f.endswith(".pdf")]
     all_images = []
+    Path(save_loc).mkdir(parents=True, exist_ok=True)
 
     for doc_id, pdf_file in enumerate(pdf_files):
         #pdf_path = os.path.join(pdf_folder, pdf_file)
