@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment files
+.env
+.venv/
+
+# IDE / notebook artefacts
+.ipynb_checkpoints/
+.DS_Store
+
+# Results and cache directories (generated)
+results/**/*.pkl
+results/**/*.csv
+results/**/*.xlsx
+data/*.pkl
+*.log
