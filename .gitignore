@@ -12,8 +12,8 @@ __pycache__/
 .DS_Store
 
 # Results and cache directories (generated)
-results/**/*.pkl
-results/**/*.csv
-results/**/*.xlsx
-data/*.pkl
-*.log
+results/
+papers/
+src/vectordb/
+dict_out.pkl
+data/
