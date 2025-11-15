@@ -1,35 +1,31 @@
 #!/usr/bin/env python3
 """
-Script version of the 01_create_context_qdrant notebook.
+Experiment 01 context creation pipeline.
 
-The pipeline parses PDF papers, builds multimodal summaries with the configured
-LLMs/VLMs, and pushes the outputs plus ColPali-style representations to Qdrant.
+Steps:
+1. Parse PDFs under PAPERS_DIR using Docling via pdf_loader.
+2. Generate multimodal summaries for each configured model using prompts.
+3. Upsert text/multimodal documents into Qdrant collections.
+4. Build ColPali-style late-interaction collections (page-level embeddings).
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import json
 import os
 import pickle
-import uuid
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Iterable, List
 
 import torch
-
-# ColPali relies on custom torch.classes registries – clear stale paths in scripts.
-torch.classes.__path__ = []  # type: ignore[attr-defined]
-
 from dotenv import load_dotenv
 from huggingface_hub import login, snapshot_download
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from pdf2image import convert_from_path
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from transformers import AutoModel, AutoProcessor, AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor, AutoModel
 from transformers.utils.import_utils import is_flash_attn_2_available
 
 from colpali_engine.models import (
@@ -43,46 +39,37 @@ from colpali_engine.models import (
     ColQwen2_5_Processor,
 )
 
-from functions import pdf_loader, process_models
+from functions import (
+    pdf_loader,
+    process_models,
+    qdrant_process,
+    convert_pdfs_to_images,
+    colpali_qdrant,
+)
 
-OPEN_MODEL = "google/gemma-3-27b-it"
-OPEN_MODEL_SHORT = "Gemma3-27b"
-LI_MODEL = "vidore/colpali-v1.3-merged"
-LI_MODEL_SHORT = "ColPali"
+load_dotenv()
+
+DEFAULT_MODELS = [
+    {"model_name": "gpt-4o-2024-11-20", "model_short": "gpt-4o", "port": "9999", "text_vd": "RAG_TEXT", "mm_vd": "MM_04_GPT_4o", "late_inter": "vidore/colpali-v1.3-merged", "late_inter_short": "COL_PALI"},
+    {"model_name": "gpt-4o-mini-2024-07-18", "model_short": "gpt-4o-mini", "port": "9999", "text_vd": "RAG_TEXT", "mm_vd": "MM_05_GPT_4o_mini", "late_inter": "vidore/colpali-v1.3-merged", "late_inter_short": "COL_PALI"},
+    {"model_name": "google/gemma-3-27b-it", "model_short": "Gemma3-27b", "port": "8006", "text_vd": "RAG_TEXT", "mm_vd": "MM_07_GEMMA3_27B", "late_inter": "vidore/colpali-v1.3-merged", "late_inter_short": "COL_PALI"},
+]
+
+DEFAULT_PROMPT = (
+    "You are an expert in glycan biology and you will be querried. Here is the query: {query}\n"
+    "Task:\n"
+    "Answer clearly and concisely. You will be given Context information, which can be empty.\n"
+    "Tone: scientific and concise. Include critical numeric data, significant results, and relevant keywords if relevant.\n"
+    "Constraints:\n"
+    "Avoid generic answers.\n"
+    "Here is the Context information:\n"
+)
+
 EMBED_MODEL_ID = "BAAI/bge-base-en-v1.5"
 EMB_DIM = 768
 VECTOR_SIZE = 128
-
-MODELS = [
-    {
-        "model_name": "gpt-4o-2024-11-20",
-        "model_short": "gpt-4o",
-        "port": "9999",
-        "text_vd": "RAG_TEXT",
-        "mm_vd": "MM_04_GPT_4o",
-        "late_inter": LI_MODEL,
-        "late_inter_short": LI_MODEL_SHORT,
-    },
-    {
-        "model_name": "gpt-4o-mini-2024-07-18",
-        "model_short": "gpt-4o-mini",
-        "port": "9999",
-        "text_vd": "RAG_TEXT",
-        "mm_vd": "MM_05_GPT_4o_mini",
-        "late_inter": LI_MODEL,
-        "late_inter_short": LI_MODEL_SHORT,
-    },
-    {
-        "model_name": OPEN_MODEL,
-        "model_short": OPEN_MODEL_SHORT,
-        "port": "8006",
-        "text_vd": "RAG_TEXT",
-        "mm_vd": "MM_07_GEMMA3_27B",
-        "late_inter": LI_MODEL,
-        "late_inter_short": LI_MODEL_SHORT,
-    },
-]
-
+#add doi manually!!! or empty list same length as papers
+#doi_papers = ["" for _ in papers]
 DEFAULT_DOIS = [
     "https://doi.org/10.1038/s41590-024-01916-8",
     "https://doi.org/10.1186/s12967-018-1695-0",
@@ -111,20 +98,23 @@ DEFAULT_DOIS = [
     "https://doi.org/10.4049/jimmunol.2400447",
 ]
 
-PROMPTS_PICKLE = Path("prompts_used.pkl")
-DICT_OUT_PICKLE = Path("dict_out.pkl")
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Create Experiment 01 context collections.")
+    parser.add_argument("--papers-dir", default=os.environ.get("PAPERS_DIR", "./papers"), help="Directory containing source PDFs.")
+    parser.add_argument("--vd-dir", default=os.environ.get("VD_DIR"), help="Vector DB storage directory.")
+    parser.add_argument("--prompts-path", default="prompts_used.pkl", help="Pickled prompts used for image summarisation.")
+    parser.add_argument("--models-config", default=None, help="Optional JSON file describing model configuration overrides.")
+    parser.add_argument("--doi-file", default=None, help="Optional text file with one DOI/URL per line.")
+    parser.add_argument("--huggingface-login", action="store_true", help="Login to HuggingFace Hub using the env token.")
+    parser.add_argument("--qdrant-url", default=os.environ.get("QDRANT_URL", "http://localhost:6333"), help="Qdrant service URL.")
+    parser.add_argument("--device", default=None, help="Override the device used for retrievers (default: auto).")
+    return parser.parse_args()
 
 
-def ensure_env(name: str) -> str:
-    """Fetch a required environment variable."""
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"Environment variable {name} must be set.")
-    return value
-
-
-def determine_device() -> str:
-    """Prefer CUDA, fall back to MPS/CPU if unavailable."""
+def resolve_device(device_override: str | None) -> str:
+    if device_override:
+        return device_override
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -132,198 +122,90 @@ def determine_device() -> str:
     return "cpu"
 
 
-def build_embedding_stack(device: str):
-    """Initialise the BGE encoder used for LangChain documents."""
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBED_MODEL_ID,
-        model_kwargs={"device": device},
-    )
-    tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_ID)
-    return embeddings, tokenizer
-
-
-def login_and_cache_open_model() -> None:
-    """Authenticate with HuggingFace Hub and prefetch the Gemma weights."""
-    token = ensure_env("HUGGING_FACE_HUB_TOKEN")
-    cache_root = Path(ensure_env("HF_DIR")).expanduser()
-    cache_dir = cache_root / "hub"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    login(token=token)
-    snapshot_download(repo_id=OPEN_MODEL, cache_dir=str(cache_dir))
-
-
-def load_prompts(path: Path):
-    """Load the prompt dictionary used for multimodal summarisation."""
-    with path.open("rb") as handle:
-        return pickle.load(handle)
-
-
-async def run_model_processing(processed_multi, prompts):
-    """Mirror the notebook-level await call."""
-    outputs = await process_models(processed_multi, prompts, MODELS)
-    return outputs
-
-
-def align_dois(papers: Sequence[Path]) -> list[str]:
-    """Ensure we have one DOI/URL per paper."""
-    if len(DEFAULT_DOIS) == len(papers):
-        return list(DEFAULT_DOIS)
-    if not DEFAULT_DOIS:
-        return [""] * len(papers)
-
-    print(
-        "Warning: DOI list length does not match number of papers. "
-        "Excess entries are dropped; missing entries are padded with blanks."
-    )
-    dois = list(DEFAULT_DOIS[: len(papers)])
-    if len(dois) < len(papers):
-        dois.extend([""] * (len(papers) - len(dois)))
-    return dois
-
-
 def list_papers(papers_dir: Path) -> list[Path]:
-    """Collect PDF files from PAPERS_DIR."""
+    if not papers_dir.exists():
+        raise FileNotFoundError(f"Papers directory not found: {papers_dir}")
     return sorted([path for path in papers_dir.iterdir() if path.suffix.lower() == ".pdf"])
 
 
-def chunk_points(points: Sequence[qmodels.PointStruct], batch_size: int) -> Iterable[Sequence[qmodels.PointStruct]]:
-    """Yield Qdrant points in fixed-size batches for upsert calls."""
-    for start in range(0, len(points), batch_size):
-        yield points[start : start + batch_size]
+def read_doi_file(path: str | None, num_papers: int) -> list[str]:
+    if path is None:
+        return DEFAULT_DOIS[:num_papers] if len(DEFAULT_DOIS) >= num_papers else [""] * num_papers
+    with open(path, "r", encoding="utf-8") as fh:
+        lines = [line.strip() for line in fh if line.strip()]
+    if len(lines) != num_papers:
+        raise ValueError(f"DOI file contains {len(lines)} entries, but {num_papers} PDFs were found.")
+    return lines
 
 
-def get_ret_model_processor(model_id: str, device: str):
-    """Instantiate the requested vision retriever."""
-    attn_impl = "flash_attention_2" if is_flash_attn_2_available() else None
-    if model_id == "vidore/colpali-v1.3-merged":
-        processor = ColPaliProcessor.from_pretrained(model_id)
-        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+def load_prompts(path: str | None):
+    if path and Path(path).exists():
+        with open(path, "rb") as fh:
+            return pickle.load(fh)
+    return DEFAULT_PROMPT
+
+
+def ensure_dirs(paths: Iterable[Path]) -> None:
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def login_hf_if_needed(do_login: bool) -> None:
+    if not do_login:
+        return
+    token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        raise RuntimeError("HUGGING_FACE_HUB_TOKEN not set.")
+    login(token=token)
+    snapshot_download(repo_id=DEFAULT_MODELS[-1]["model_name"], cache_dir=os.environ["HF_DIR"] + "hub/")
+
+
+def load_retriever(model_name: str, device: str):
+    if model_name == "vidore/colpali-v1.3-merged":
+        processor = ColPaliProcessor.from_pretrained(model_name)
+        dtype = torch.float16 if device.startswith("cuda") else torch.float32
         model = ColPaliForRetrieval.from_pretrained(
-            model_id,
+            model_name,
             torch_dtype=dtype,
             device_map=device,
-            attn_implementation=attn_impl,
+            attn_implementation="flash_attention_2" if is_flash_attn_2_available() else None,
         ).eval()
-    elif model_id == "ahmed-masry/ColFlor":
-        processor = ColFlorProcessor.from_pretrained(model_id)
+    elif model_name == "ahmed-masry/ColFlor":
+        processor = ColFlorProcessor.from_pretrained(model_name)
         model = ColFlor.from_pretrained(
-            model_id,
+            model_name,
             device_map=device,
-            attn_implementation=attn_impl,
+            attn_implementation="flash_attention_2" if is_flash_attn_2_available() else None,
         ).eval()
-    elif model_id == "vidore/colSmol-500M":
-        processor = ColIdefics3Processor.from_pretrained(model_id)
+    elif model_name == "vidore/colSmol-500M":
+        processor = ColIdefics3Processor.from_pretrained(model_name)
         model = ColIdefics3.from_pretrained(
-            model_id,
+            model_name,
             device_map=device,
-            attn_implementation=attn_impl,
+            attn_implementation="flash_attention_2" if is_flash_attn_2_available() else None,
         ).eval()
-    elif model_id == "ibm-granite/granite-vision-3.3-2b-embedding":
-        processor = AutoProcessor.from_pretrained(model_id)
+    elif model_name == "ibm-granite/granite-vision-3.3-2b-embedding":
+        processor = AutoProcessor.from_pretrained(model_name)
         model = AutoModel.from_pretrained(
-            model_id,
+            model_name,
             device_map=device,
-            attn_implementation=attn_impl,
+            attn_implementation="flash_attention_2" if is_flash_attn_2_available() else None,
         ).eval()
-    elif model_id == "vidore/colqwen2.5-v0.2":
-        processor = ColQwen2_5_Processor.from_pretrained(model_id)
-        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    elif model_name == "vidore/colqwen2.5-v0.2":
+        processor = ColQwen2_5_Processor.from_pretrained(model_name)
+        dtype = torch.float16 if device.startswith("cuda") else torch.float32
         model = ColQwen2_5.from_pretrained(
-            model_id,
+            model_name,
             torch_dtype=dtype,
             device_map=device,
-            attn_implementation=attn_impl,
+            attn_implementation="flash_attention_2" if is_flash_attn_2_available() else None,
         ).eval()
     else:
-        raise ValueError(f"Unsupported late-interaction model: {model_id}")
+        raise ValueError(f"Unsupported late-interaction model: {model_name}")
     return model, processor
 
 
-def convert_pdf_dir_to_images(pdf_dir: Path):
-    """Load every PDF as a sequence of PIL images."""
-    mapping: dict[str, list] = {}
-    for pdf_path in sorted(pdf_dir.glob("*.pdf")):
-        mapping[pdf_path.name] = convert_from_path(str(pdf_path))
-    return mapping
-
-
-def to_tensor(output: Any) -> torch.Tensor:
-    """Convert a HF model output into a plain tensor."""
-    if isinstance(output, torch.Tensor):
-        return output
-    if isinstance(output, (list, tuple)) and output:
-        return to_tensor(output[0])
-    for attr in ("last_hidden_state", "pooler_output", "embeddings"):
-        if hasattr(output, attr):
-            return getattr(output, attr)
-    raise TypeError(f"Unsupported model output type: {type(output)}")
-
-
-def create_document_embeddings(
-    pdf_dir: Path,
-    model,
-    processor,
-    image_root: Path,
-    batch_size: int = 4,
-) -> list[qmodels.PointStruct]:
-    """Produce Qdrant-ready points for every PDF page."""
-    all_points: list[qmodels.PointStruct] = []
-    documents = convert_pdf_dir_to_images(pdf_dir)
-
-    # Some retriever models expose .device, others require reading from parameters.
-    try:
-        model_device = model.device  # type: ignore[attr-defined]
-    except AttributeError:
-        model_device = next(model.parameters()).device  # type: ignore[attr-defined]
-
-    for doc_id, (filename, images) in enumerate(documents.items()):
-        dataloader = DataLoader(
-            dataset=images,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=lambda batch: processor.process_images(batch),
-        )
-        page_counter = 1
-        for batch in tqdm(dataloader, desc=f"Processing {filename}"):
-            with torch.no_grad():
-                inputs = {key: value.to(model_device) for key, value in batch.items()}
-                tensor = to_tensor(model(**inputs))
-                cpu_embeddings = list(torch.unbind(tensor.to("cpu")))
-
-            for embedding in cpu_embeddings:
-                img_link = image_root / f"{Path(filename).stem}_{page_counter:03d}.png"
-                all_points.append(
-                    qmodels.PointStruct(
-                        id=str(uuid.uuid4()),
-                        vector=embedding.tolist(),
-                        payload={
-                            "metadata": {
-                                "doc_id": doc_id,
-                                "page_id": page_counter,
-                                "file_name": filename,
-                                "img_link": str(img_link),
-                            }
-                        },
-                    )
-                )
-                page_counter += 1
-
-    return all_points
-
-
-def ensure_collection(client: QdrantClient, name: str, size: int, distance=qmodels.Distance.COSINE):
-    """Create a dense Qdrant collection if it does not already exist."""
-    if client.collection_exists(collection_name=name):
-        return
-    client.create_collection(
-        collection_name=name,
-        on_disk_payload=True,
-        vectors_config=qmodels.VectorParams(size=size, distance=distance, on_disk=True),
-    )
-
-
-def ensure_multivector_collection(client: QdrantClient, name: str):
-    """Create the multi-vector late interaction collection if required."""
+def ensure_colpali_collection(client: QdrantClient, name: str) -> None:
     if client.collection_exists(collection_name=name):
         return
     client.create_collection(
@@ -334,73 +216,104 @@ def ensure_multivector_collection(client: QdrantClient, name: str):
             distance=qmodels.Distance.COSINE,
             on_disk=True,
             multivector_config=qmodels.MultiVectorConfig(
-                comparator=qmodels.MultiVectorComparator.MAX_SIM
+                comparator=qmodels.MultiVectorComparator.MAX_SIM,
             ),
         ),
     )
 
 
-def main() -> None:
-    load_dotenv()
-    device = determine_device()
-    embeddings, emb_tokenizer = build_embedding_stack(device)
-    login_and_cache_open_model()
+def load_models(config_path: str | None) -> List[dict]:
+    if config_path is None:
+        return DEFAULT_MODELS
+    with open(config_path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
 
-    papers_dir = Path(os.environ.get("PAPERS_DIR", "./papers")).resolve()
+
+async def main() -> None:
+    args = parse_args()
+    device = resolve_device(args.device)
+    login_hf_if_needed(args.huggingface_login)
+
+    papers_dir = Path(args.papers_dir)
+    vd_dir = Path(args.vd_dir or os.environ.get("VD_DIR", "./src/vectordb"))
+    ensure_dirs([vd_dir])
+
     papers = list_papers(papers_dir)
-    if not papers:
-        raise RuntimeError(f"No PDF files found in {papers_dir}")
+    doi_links = read_doi_file(args.doi_file, len(papers))
+    prompts = load_prompts(args.prompts_path)
 
-    doi_links = align_dois(papers)
-    vd_dir = ensure_env("VD_DIR")
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBED_MODEL_ID,
+        model_kwargs={"device": device if device != "mps" else "cpu"},
+    )
+    tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_ID)
+
     processed_multi, processed_text = pdf_loader(
-        [str(p) for p in papers],
-        doi_links,
-        [p.name for p in papers],
-        vd_dir,
-        emb_tokenizer,
+        papers=[str(p) for p in papers],
+        doi_links=doi_links,
+        filenames=[p.name for p in papers],
+        vd_dir=str(vd_dir),
+        vd_tokenizer=tokenizer,
     )
 
-    prompts = load_prompts(PROMPTS_PICKLE)
-    dict_outputs = asyncio.run(run_model_processing(processed_multi, prompts))
-    dict_outputs["text_only"] = processed_text
-    with DICT_OUT_PICKLE.open("wb") as handle:
-        pickle.dump(dict_outputs, handle)
+    models_cfg = load_models(args.models_config)
+    model_outputs = await process_models(processed_multi, prompts, models_cfg)
+    model_outputs["text_only"] = processed_text
 
-    qdrant_api_key = ensure_env("QDRANT_API_KEY")
-    qdrant_url = os.environ.get("QDRANT_URL", f"http://localhost:{os.environ.get('QDRANT_PORT', '6333')}")
-    qdrant_client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+    qdrant_client = QdrantClient(url=args.qdrant_url, api_key=os.environ.get("QDRANT_API_KEY"))
 
-    text_collection_upserted = False
-    image_root = Path(vd_dir) / "pg_images"
-
-    for idx, model_cfg in enumerate(MODELS):
-        if idx == 0 and not text_collection_upserted:
-            ensure_collection(qdrant_client, model_cfg["text_vd"], EMB_DIM)
-            QdrantVectorStore.from_documents(
-                documents=dict_outputs["text_only"],
-                url=qdrant_url,
-                api_key=qdrant_api_key,
-                collection_name=model_cfg["text_vd"],
-                embedding=embeddings,
+    # Upsert text and multimodal documents
+    text_loaded = False
+    for model_cfg in models_cfg:
+        if not text_loaded:
+            qdrant_process(
+                docs=model_outputs["text_only"],
+                qdrant_client=qdrant_client,
+                vec_db=model_cfg["text_vd"],
+                emb_dim=EMB_DIM,
+                embeddings=embeddings,
+                url=args.qdrant_url,
             )
-            text_collection_upserted = True
+            text_loaded = True
 
-        ensure_collection(qdrant_client, model_cfg["mm_vd"], EMB_DIM)
-        QdrantVectorStore.from_documents(
-            documents=dict_outputs[model_cfg["model_short"]],
-            url=qdrant_url,
-            api_key=qdrant_api_key,
-            collection_name=model_cfg["mm_vd"],
-            embedding=embeddings,
+        qdrant_process(
+            docs=model_outputs[model_cfg["model_short"]],
+            qdrant_client=qdrant_client,
+            vec_db=model_cfg["mm_vd"],
+            emb_dim=EMB_DIM,
+            embeddings=embeddings,
+            url=args.qdrant_url,
         )
 
-        ensure_multivector_collection(qdrant_client, model_cfg["late_inter_short"])
-        model_li, processor_li = get_ret_model_processor(model_cfg["late_inter"], device)
-        points = create_document_embeddings(papers_dir, model_li, processor_li, image_root, batch_size=4)
-        for batch in chunk_points(points, batch_size=10):
-            qdrant_client.upsert(collection_name=model_cfg["late_inter_short"], points=batch)
+    # ColPali collections
+    page_cache = vd_dir / "pg_images"
+    dataset = convert_pdfs_to_images([str(p) for p in papers], str(page_cache))
+
+    for model_cfg in models_cfg:
+        ensure_colpali_collection(qdrant_client, model_cfg["late_inter_short"])
+        retriever_model, retriever_processor = load_retriever(model_cfg["late_inter"], device)
+        colpali_qdrant(
+            dataset,
+            [str(p) for p in papers],
+            doi_links,
+            retriever_model,
+            retriever_processor,
+            qdrant_client,
+            model_cfg["late_inter_short"],
+        )
+
+    print("[done] Context creation completed.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except RuntimeError as exc:
+        if "asyncio.run() cannot be called" in str(exc):
+            import nest_asyncio
+
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(main())
+        else:
+            raise

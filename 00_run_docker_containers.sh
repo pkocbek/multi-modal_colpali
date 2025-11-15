@@ -1,25 +1,29 @@
 #!/bin/sh
 
+# -----------------------------------------------------------------------------
+# Bootstraps the core Experiment 01 infrastructure:
+#   * Qdrant (with GPU indexing) exposed on ports 6333/6334
+#   * Gemma 3 27B vLLM endpoint exposed on port 8006
+# Requires a populated .env (see README) and docker permissions.
+# -----------------------------------------------------------------------------
+
 export $(xargs < .env)
 
-newgrp docker
-
-docker run \
-	--rm \
+docker run -d \
     --name qdrant_vd \
-	--gpus=all \
-	-p 6333:6333 \
-	-p 6334:6334 \
-	-e QDRANT__GPU__INDEXING=1 \
+    --gpus all \
+    -p 6333:6333 \
+    -p 6334:6334 \
+    -e QDRANT__GPU__INDEXING=1 \
     -e "QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}" \
     --ulimit nofile=65536:65536 \
     -v "${VD_DIR}/storage:/qdrant/storage" \
     -v "${VD_DIR}/custom_config.yaml:/qdrant/config/custom_config.yaml" \
-	qdrant/qdrant:gpu-nvidia-latest
+    qdrant/qdrant:gpu-nvidia-latest
 
 
 #add --pull=always if needed
-docker run --gpus all -it \
+docker run -d --gpus all \
     --name gemma_27b \
     -v "${HF_DIR}:/root/.cache/huggingface" \
     --env "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}" \

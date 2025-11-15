@@ -28,6 +28,7 @@ from docling_core.types.doc.document import DoclingDocument
 from docling.chunking import HybridChunker
 
 from pathlib import Path
+from io import BytesIO
 import time
 
 from langchain_core.documents import Document
@@ -711,6 +712,55 @@ def convert_pdf_dir_to_images(pdf_dir: str) -> dict[str, list[Image.Image]]:
 
     return images_per_pdf
 
+def encode_image_to_data_url(image_path: str, fixed_width: int = 1024) -> str | None:
+    """Convert an image into a base64 data URL for multimodal prompts."""
+    try:
+        img = Image.open(image_path).convert("RGB")
+    except Exception:
+        return None
+    width, height = img.size
+    if width <= 0 or height <= 0:
+        return None
+    new_height = int(fixed_width * height / width)
+    resized = img.resize((fixed_width, max(new_height, 1)), resample=Image.LANCZOS)
+    buffer = BytesIO()
+    resized.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+def build_choice_string(answers: list[str]) -> str:
+    """Return a formatted string with MCQ answer choices."""
+    return "\n".join(f"{letter}. {option}" for letter, option in zip(["A", "B", "C", "D"], answers))
+
+def build_instruction_block(question: str, answers: list[str]) -> str:
+    """Create the base instruction block used for multimodal MCQ prompting."""
+    return (
+        "You are an expert biomedical researcher. Carefully read the question and the answer choices.\n"
+        f"Question: {question}\nChoices:\n{build_choice_string(answers)}\n"
+        "If contextual snippets are provided, use them judiciously. "
+        "Respond with a single capital letter (A, B, C, or D)."
+    )
+
+def build_reference_from_metadata(metadata: dict) -> str:
+    """Compact reference label composed of document name and page index."""
+    doc = metadata.get("document_name") or metadata.get("file_name") or "doc"
+    page = metadata.get("page_no") or metadata.get("page_id")
+    return f"{doc}_pg_{page}" if page is not None else doc
+
+def document_to_context_entry(doc, score: float) -> dict:
+    """
+    Convert a LangChain document returned from Qdrant into a neutral context entry
+    that can be consumed by multimodal prompt builders.
+    """
+    metadata = doc.metadata or {}
+    doc_type = metadata.get("type", "text")
+    return {
+        "type": "image" if doc_type in {"image", "pdf_page"} else "text",
+        "text": doc.page_content if doc_type in {"text", "table"} else "",
+        "image_path": metadata.get("img_link"),
+        "reference": build_reference_from_metadata(metadata),
+        "score": score,
+    }
 
 def create_document_embeddings(
     pdf_dir: str,
@@ -2375,4 +2425,3 @@ def run_ci_summary(
     )
 
     return per_iteration_display, summary_table, merged_df
-
