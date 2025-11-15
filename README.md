@@ -96,6 +96,8 @@ multi-modal_colpali/
    - VLLM (Gemma 3 27B) is available via `http://localhost:8006/v1`.
    - Qdrant persists data under `${VD_DIR}` (`storage/`, `custom_config.yaml`).
 
+Notes on models:
+<small>
 | Model                                           | Temperature | Seed  | Notes                                              |
 |------------------------------------------------|------------:|:-----:|----------------------------------------------------|
 | AdaptLLM/biomed-LLaVA-NeXT-Llama3-8B           | 0.6         | 0     | Default values from model / vLLM config           |
@@ -107,7 +109,7 @@ multi-modal_colpali/
 | gpt-5                                          | N/A         | rnd.  | Temperature parameter removed; random seed per run|
 | gpt-5-mini                                     | N/A         | rnd.  | Temperature parameter removed; random seed per run|
 | gpt-5-nano                                     | N/A         | rnd.  | Temperature parameter removed; random seed per run|
-
+</small>
 3. **Health checks**
    - Visit `http://localhost:6333/dashboard` (if enabled) or use the REST API.
    - `curl http://localhost:8006/v1/models` to confirm the VLLM endpoint.
