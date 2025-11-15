@@ -111,17 +111,26 @@ multi-modal_colpali/
 2. **Generate context collections**
    ```bash
    python 01_create_context_qdrant.py \
+     --papers-dir ./papers \
+     --vd-dir "$VD_DIR" \
+     --prompts-path prompts_used.pkl \
      --huggingface-login \
-     --models-config configs/models_exp01.json  # optional override
+     --qdrant-url http://localhost:6333
    ```
 
    Key actions:
-   - Parses PDFs with Docling, storing text, tables, and images into `${VD_DIR}`.
-   - Summarises images for each configured model using prompts from `prompts_used.pkl`.
+   - Parses PDFs with Docling via `pdf_loader`, storing text/tables/images under `${VD_DIR}`.
+   - Summarises every page for each configured model using prompts from `prompts_used.pkl`
+     (or a fallback default prompt).
    - Uploads documents to Qdrant:
-     - Text-only collection (shared).
+     - Shared text-only collection.
      - Multimodal collections (one per generator).
-     - ColPali late-interaction pages stored as dense vectors.
+     - ColPali late-interaction pages stored as page-level embeddings.
+
+   CLI options:
+   - `--doi-file` lets you override DOIs/links (otherwise defaults are used/padded).
+   - `--models-config` accepts a JSON override for `DEFAULT_MODELS`.
+   - `--device` forces CPU/CUDA/MPS for summarisation and ColPali steps.
 
 3. **Adapting to new domains**
    - Swap PDFs, update DOIs as needed, and re-run `01_create_context_qdrant.py`.
@@ -147,10 +156,13 @@ python 02_experiment01.py \
 - `--type mm_RAG` + `--vector_db <collection>` for text/multimodal runs.
 - `--type colpali` targets late-interaction collections; the script automatically
   permutes answers when `--perm_quest` evaluates truthy.
+- Regardless of the mode, the driver injects both text and image snippets directly
+  into the prompt (images are encoded as data URLs; text carries inline references).
 
 ### 5.2 Batch Runner
 
-Use the orchestrator for 5 repeats per collection, with and without permutation:
+Use the orchestrator for repeated sweeps (permuted and non-permuted runs). You can
+also override the retrieval depth via `--top_k`:
 
 ```bash
 python 03_experiment01_run.py \
@@ -160,7 +172,8 @@ python 03_experiment01_run.py \
   --vd_mm_name "MM_07_GEMMA3_27B" \
   --vd_colpali_name "COL_PALI" \
   --vd_text_name "RAG_TEXT" \
-  --repeats 5
+  --repeats 5 \
+  --top_k 5
 ```
 
 Outputs land in `results/eval/`, following the pattern:
@@ -177,7 +190,7 @@ python 04_experiment01_eval.py \
   --full-path results/eval_full_results.xlsx
 ```
 
-This Produces:
+This produces:
 - Accuracy by difficulty & retrieval (summary sheet).
 - Majority-vote accuracy across repeats.
 - Full merged dataset for downstream analysis.
@@ -201,16 +214,18 @@ This Produces:
    - Embedding caches are stored under `data/` to speed up re-runs.
    - `--context` toggles retrieval-augmented prompting; omit for no-context runs.
 
-2. **Summarise results**
+2. **Summarise results (CSV or pickle inputs)**
    ```bash
    python 06_experiment02_eval.py \
      --results_dir results/evals \
      --output results/summary.xlsx \
      --models gpt-5 gpt-5-mini gpt-5-nano \
-     --retrievers vidore/colpali-v1.3-merged vidore/colqwen2.5-v0.2 ahmed-masry/ColFlor
-   ```
+ --retrievers vidore/colpali-v1.3-merged vidore/colqwen2.5-v0.2 ahmed-masry/ColFlor
+  ```
 
-   Generates an Excel workbook with per-difficulty metrics and raw evaluations.
+   Generates an Excel workbook with per-difficulty metrics and raw evaluations,
+   consuming whichever mix of `.csv` / `.pkl` files you collected in `results/evals`;
+   confidence intervals are written with embedded line breaks for readability.
 
 ---
 
@@ -220,7 +235,8 @@ Key helpers centralised for reuse:
 
 - **Docling ingest & chunking**: `doc_conv`, `data_preparation`, `pdf_loader`.
 - **Image handling**: `resize_image`, `convert_pdfs_to_images`.
-- **Evaluation scaffolding**: `format_msgs`, `response_real_out`, async HTTP utilities.
+- **Evaluation scaffolding**: `format_msgs`, `response_real_out`, async HTTP utilities,
+  multimodal prompt helpers (`encode_image_to_data_url`, `build_instruction_block`, etc.).
 - **Vector DB operations**: `qdrant_process`, `colpali_qdrant`, `retrieve_colpali`.
 - **Experiment 02 support**: `convert_pdf_dir_to_images`, `create_document_embeddings`.
 

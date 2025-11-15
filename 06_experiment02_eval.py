@@ -47,11 +47,25 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_results(results_dir: Path) -> pd.DataFrame:
-    """Load and concatenate all CSV result files in the target directory."""
+    """Load and concatenate all CSV/pickle result files in the target directory."""
     csv_files = sorted(results_dir.glob("*.csv"))
-    if not csv_files:
-        raise FileNotFoundError(f"No CSV files found in {results_dir}")
-    frames = [pd.read_csv(csv_file) for csv_file in csv_files]
+    pkl_files = sorted(results_dir.glob("*.pkl"))
+    files = csv_files + pkl_files
+    if not files:
+        raise FileNotFoundError(f"No CSV or pickle files found in {results_dir}")
+
+    frames: list[pd.DataFrame] = []
+    for path in files:
+        if path.suffix == ".csv":
+            frames.append(pd.read_csv(path))
+            continue
+        data = pd.read_pickle(path)
+        if isinstance(data, pd.DataFrame):
+            frames.append(data)
+        elif isinstance(data, dict):
+            frames.append(pd.DataFrame(data))
+        else:
+            frames.append(pd.DataFrame(data))
     return pd.concat(frames, ignore_index=True)
 
 
@@ -84,6 +98,11 @@ def build_summary_table(
     df = df.copy()
     df["Model"] = pd.Categorical(df["Model"], categories=models, ordered=True)
     df["Model_ret"] = pd.Categorical(df["Model_ret"], categories=retrievers, ordered=True)
+    df["Difficulty"] = pd.Categorical(
+        df["Difficulty"],
+        categories=["Easy", "Medium", "Hard"],
+        ordered=True,
+    )
     df["is_paper_id_in_context"] = df.apply(parse_context_presence, axis=1)
 
     grouped = df.groupby(["Model", "Model_ret", "Difficulty"], observed=True)
@@ -133,6 +152,12 @@ def main() -> None:
 
     data = load_results(results_dir)
     summary, raw = build_summary_table(data, args.models, args.retrievers)
+
+    def replace_literal_newlines(df: pd.DataFrame) -> pd.DataFrame:
+        return df.applymap(lambda val: val.replace("\\n", "\n") if isinstance(val, str) else val)
+
+    summary = replace_literal_newlines(summary)
+    raw = replace_literal_newlines(raw)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path) as writer:

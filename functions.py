@@ -28,6 +28,7 @@ from docling_core.types.doc.document import DoclingDocument
 from docling.chunking import HybridChunker
 
 from pathlib import Path
+from io import BytesIO
 import time
 
 from langchain_core.documents import Document
@@ -711,6 +712,55 @@ def convert_pdf_dir_to_images(pdf_dir: str) -> dict[str, list[Image.Image]]:
 
     return images_per_pdf
 
+def encode_image_to_data_url(image_path: str, fixed_width: int = 1024) -> str | None:
+    """Convert an image into a base64 data URL for multimodal prompts."""
+    try:
+        img = Image.open(image_path).convert("RGB")
+    except Exception:
+        return None
+    width, height = img.size
+    if width <= 0 or height <= 0:
+        return None
+    new_height = int(fixed_width * height / width)
+    resized = img.resize((fixed_width, max(new_height, 1)), resample=Image.LANCZOS)
+    buffer = BytesIO()
+    resized.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+def build_choice_string(answers: list[str]) -> str:
+    """Return a formatted string with MCQ answer choices."""
+    return "\n".join(f"{letter}. {option}" for letter, option in zip(["A", "B", "C", "D"], answers))
+
+def build_instruction_block(question: str, answers: list[str]) -> str:
+    """Create the base instruction block used for multimodal MCQ prompting."""
+    return (
+        "You are an expert biomedical researcher. Carefully read the question and the answer choices.\n"
+        f"Question: {question}\nChoices:\n{build_choice_string(answers)}\n"
+        "If contextual snippets are provided, use them judiciously. "
+        "Respond with a single capital letter (A, B, C, or D)."
+    )
+
+def build_reference_from_metadata(metadata: dict) -> str:
+    """Compact reference label composed of document name and page index."""
+    doc = metadata.get("document_name") or metadata.get("file_name") or "doc"
+    page = metadata.get("page_no") or metadata.get("page_id")
+    return f"{doc}_pg_{page}" if page is not None else doc
+
+def document_to_context_entry(doc, score: float) -> dict:
+    """
+    Convert a LangChain document returned from Qdrant into a neutral context entry
+    that can be consumed by multimodal prompt builders.
+    """
+    metadata = doc.metadata or {}
+    doc_type = metadata.get("type", "text")
+    return {
+        "type": "image" if doc_type in {"image", "pdf_page"} else "text",
+        "text": doc.page_content if doc_type in {"text", "table"} else "",
+        "image_path": metadata.get("img_link"),
+        "reference": build_reference_from_metadata(metadata),
+        "score": score,
+    }
 
 def create_document_embeddings(
     pdf_dir: str,
@@ -1896,3 +1946,482 @@ def setup_initial_vector_db (username, models, local_dict="", model1 ="BAAI/bge-
 
 
     print(f"initial vectorDB set up for use {username}.")
+
+import pandas as pd
+import numpy as np
+from statsmodels.stats.proportion import proportion_confint
+from statsmodels.stats.weightstats import DescrStatsW
+import glob
+import ast
+
+DEFAULT_PRICES_GPT = [
+    {"model": "gpt-5", "price_1M_output": 10, "price_1M_input": 1.25},
+    {"model": "gpt-5-mini", "price_1M_output": 2, "price_1M_input": 0.25},
+    {"model": "gpt-5-nano", "price_1M_output": 0.4, "price_1M_input": 0.05},
+]
+DEFAULT_PRICE_DICT = {p['model']: p['price_1M_output'] for p in DEFAULT_PRICES_GPT}
+
+def get_metric_descriptions(top_k):
+    """
+    Returns a description dictionary for the key metrics given a Precision@k label.
+    """
+    precision_label = f'P@{top_k}'
+    return {
+        "Cor_answer": "Average correctness rate per question",
+        "Elapsed": "Average wall-clock time per question (seconds)",
+        "Total_tokens": "Average total tokens consumed per question",
+        precision_label: f"Precision@{top_k}: share of retrieved documents containing the reference paper",
+        "Throughput": "Average tokens processed per second",
+        "Cost": "USD spent per iteration/run",
+        "Price-per-cost": "Cents spent per correct answer",
+    }
+
+METRIC_DESCRIPTIONS = get_metric_descriptions(5)
+
+__all__ = [
+    "DEFAULT_PRICES_GPT",
+    "DEFAULT_PRICE_DICT",
+    "METRIC_DESCRIPTIONS",
+    "get_metric_descriptions",
+    "proportion_ci",
+    "mean_confidence_interval",
+    "merge_data",
+    "run_analysis",
+    "run_ci_summary",
+]
+
+def proportion_ci(series):
+    """
+    Calculates the Agresti-Coull confidence interval for a proportion.
+    """
+    count = series.sum()
+    nobs = series.count()
+    if nobs == 0:
+        return np.nan, np.nan
+    ci_low, ci_upp = proportion_confint(count, nobs, method='agresti_coull')
+    return ci_low, ci_upp
+
+def mean_confidence_interval(series, non_negative=False):
+    """
+    Calculates the confidence interval for a mean.
+    If non_negative is True, the lower bound of the CI is clipped at 0.
+    """
+    if series.count() < 2:
+        return np.nan, np.nan
+    ci_low, ci_upp = DescrStatsW(series.dropna()).tconfint_mean(alpha=0.05, alternative='two-sided')
+    if non_negative:
+        ci_low = max(0, ci_low)
+    return ci_low, ci_upp
+
+def _format_ci_cell(mean_val, low_val, upp_val, decimals=3):
+    """Formats a mean/CI triplet for display."""
+    if pd.isna(mean_val) or pd.isna(low_val) or pd.isna(upp_val):
+        return 'N/A'
+    low_val = max(0, low_val)
+    value_fmt = f'{{:.{decimals}f}}'
+    return f"{value_fmt.format(mean_val)}\n[{value_fmt.format(low_val)}, {value_fmt.format(upp_val)}]"
+
+def _attach_ci_bounds(df, ci_col, low_col, upp_col):
+    """
+    Expands a CI column that stores tuples into two numeric columns.
+    """
+    if ci_col not in df.columns:
+        df[low_col] = np.nan
+        df[upp_col] = np.nan
+        return df
+
+    if df.empty:
+        df[low_col] = pd.Series(dtype=float)
+        df[upp_col] = pd.Series(dtype=float)
+        return df.drop(columns=[ci_col])
+
+    bounds = df[ci_col].apply(
+        lambda val: val if isinstance(val, tuple) and len(val) == 2 else (np.nan, np.nan)
+    )
+    df[low_col] = bounds.apply(lambda val: val[0])
+    df[upp_col] = bounds.apply(lambda val: val[1])
+    return df.drop(columns=[ci_col])
+
+def build_ci_metric_specs(precision_label):
+    """
+    Builds the CI metric configuration for the requested Precision@k label.
+    """
+    return [
+        {
+            "display": "Cor_answer",
+            "source_col": "mean_cor_answer",
+            "mean_col": "mean_cor_answer",
+            "ci_col": "ci_cor_answer",
+            "ci_func": proportion_ci,
+            "decimals": 3,
+        },
+        {
+            "display": "Elapsed",
+            "source_col": "mean_elapsed",
+            "mean_col": "mean_elapsed",
+            "ci_col": "ci_elapsed",
+            "ci_func": mean_confidence_interval,
+            "decimals": 2,
+        },
+        {
+            "display": "Total_tokens",
+            "source_col": "mean_tokens",
+            "mean_col": "mean_tokens",
+            "ci_col": "ci_tokens",
+            "ci_func": mean_confidence_interval,
+            "decimals": 1,
+        },
+        {
+            "display": precision_label,
+            "source_col": "mean_precision",
+            "mean_col": "mean_precision",
+            "ci_col": "ci_precision",
+            "ci_func": mean_confidence_interval,
+            "decimals": 3,
+        },
+        {
+            "display": "Throughput",
+            "source_col": "mean_throughput",
+            "mean_col": "mean_throughput",
+            "ci_col": "ci_mean_throughput",
+            "ci_func": lambda s: mean_confidence_interval(s, non_negative=True),
+            "decimals": 1,
+        },
+        {
+            "display": "Cost",
+            "source_col": "sum_cost",
+            "mean_col": "mean_sum_cost",
+            "ci_col": "ci_mean_sum_cost",
+            "ci_func": lambda s: mean_confidence_interval(s, non_negative=True),
+            "decimals": 2,
+        },
+        {
+            "display": "Price-per-cost",
+            "source_col": "price_per_cost",
+            "mean_col": "mean_price_per_cost",
+            "ci_col": "ci_mean_price_per_cost",
+            "ci_func": lambda s: mean_confidence_interval(s, non_negative=True),
+            "decimals": 2,
+        },
+    ]
+
+def calculate_throughput(df):
+    """Calculates tokens processed per second."""
+    return df['Total_tokens'] / df['Elapsed']
+
+def calculate_latency(df):
+    """Backward-compatible alias for calculate_throughput."""
+    return calculate_throughput(df)
+
+def calculate_precision_at_k(row, top_k=10):
+    """
+    Calculates Precision@k for the provided row.
+    """
+    paper_id_val = str(row['Paper_id'])
+    if not paper_id_val.startswith('Paper'):
+        return np.nan
+
+    paper_id = paper_id_val.lower()
+    context_papers = row['Context_papers']
+
+    if pd.isna(context_papers) or not isinstance(context_papers, str) or not context_papers.startswith('['):
+        return 0
+
+    try:
+        context_papers_list = ast.literal_eval(context_papers)
+    except (ValueError, SyntaxError):
+        return 0
+    
+    nr_el = sum([1 for el in context_papers_list if paper_id == str(el).split('_pg_')[0].lower()])
+    
+    return nr_el / top_k
+
+def calculate_is_paper_id_in_context(row, top_k=10):
+    """Backward-compatible alias for calculate_precision_at_k."""
+    return calculate_precision_at_k(row, top_k=top_k)
+
+def calculate_cost(df, price_dict):
+    """Calculates USD cost for each row."""
+    def calc_row(row):
+        model = row['Model']
+        total_tokens = row['Total_tokens']
+        price_1M = price_dict.get(model)
+        if price_1M is not None:
+            return (total_tokens / 1_000_000) * price_1M
+        return np.nan
+    return df.apply(calc_row, axis=1)
+
+def calculate_price(df, price_dict):
+    """Backward-compatible alias for calculate_cost."""
+    return calculate_cost(df, price_dict)
+
+def create_summary_table(df, group_by, analysis_vars, price_dict=None, return_numeric=False):
+    """
+    Groups a DataFrame and calculates mean and confidence intervals for specified variables.
+    This function performs a two-step aggregation (per-question, then final) to provide more robust CIs.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+        group_by (list): A list of column names to group by.
+        analysis_vars (dict): A dictionary where keys are variable names and values are agg types.
+        price_dict (dict, optional): A dictionary for price calculation.
+        return_numeric (bool): If True, return df with numeric mean, ci_low, ci_upp columns.
+
+    Returns:
+        pd.DataFrame: A summary DataFrame.
+    """
+    
+    df_copy = df.copy()
+
+    # Pre-calculations
+    for var in analysis_vars:
+        if var not in df_copy.columns:
+            if var == 'Latency':
+                df_copy['Latency'] = calculate_latency(df_copy)
+            elif var == 'is_paper_id_in_context':
+                df_copy['is_paper_id_in_context'] = df_copy.apply(calculate_is_paper_id_in_context, axis=1)
+            elif var == 'Price' and price_dict:
+                df_copy['Price'] = calculate_price(df_copy, price_dict)
+
+    # Step 1: Aggregate per question
+    per_question_group_by = group_by + ['Question_nr']
+    vars_to_agg = list(analysis_vars.keys())
+    per_question_agg_funcs = {var: 'mean' for var in vars_to_agg}
+    
+    cols_for_grouping = list(set(per_question_group_by + vars_to_agg))
+    df_for_agg = df_copy[cols_for_grouping]
+    
+    per_question_df = df_for_agg.groupby(per_question_group_by, observed=True).agg(per_question_agg_funcs).reset_index()
+
+    # Step 2: Aggregate over questions
+    agg_funcs = {}
+    for var, agg_type in analysis_vars.items():
+        is_non_negative = var in ['Latency', 'Price']
+        agg_funcs[f'mean_{var}'] = (var, 'mean')
+        if agg_type == 'proportion':
+            agg_funcs[f'ci_{var}'] = (var, proportion_ci)
+        else: # 'mean'
+            agg_funcs[f'ci_{var}'] = (var, lambda s, v=var: mean_confidence_interval(s, non_negative=(v in ['Latency', 'Price'])))
+
+    grouped = per_question_df.groupby(group_by, observed=True)
+    agg_df = grouped.agg(**agg_funcs)
+
+    # Format output
+    for var in vars_to_agg:
+        agg_df[f'ci_low_{var}'], agg_df[f'ci_upp_{var}'] = zip(*agg_df[f'ci_{var}'])
+    
+    if return_numeric:
+        # Drop the original CI tuple column and return numeric values
+        return agg_df.drop(columns=[f'ci_{var}' for var in vars_to_agg])
+
+    for var in vars_to_agg:
+        mean_col = f'mean_{var}'
+        ci_low_col = f'ci_low_{var}'
+        ci_upp_col = f'ci_upp_{var}'
+        
+        agg_df[var] = agg_df[mean_col].round(3).astype(str) + ' [' + agg_df[ci_low_col].round(3).astype(str) + '-' + agg_df[ci_upp_col].round(3).astype(str) + ']'
+        agg_df = agg_df.drop(columns=[mean_col, f'ci_{var}', ci_low_col, ci_upp_col])
+
+    return agg_df
+
+def merge_data(path):
+    """
+    Merges CSV files from a given path and adds an 'Iteration' column.
+    """
+    all_files = glob.glob(path + '*.csv')
+    dfs = []
+    iteration_counts = {}
+    for f in all_files:
+        df = pd.read_csv(f)
+        if not df.empty:
+            model_combo = (df['Model'].iloc[0], df['Model_ret'].iloc[0])
+            iteration_counts.setdefault(model_combo, 0)
+            iteration_counts[model_combo] += 1
+            df['Iteration'] = iteration_counts[model_combo]
+            dfs.append(df)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    merged_df = pd.concat(dfs, ignore_index=True)
+    return merged_df
+
+def run_analysis(path, group_by_cols, analysis_vars_dict, price_dict):
+    """
+    Runs the streamlined 2-stage analysis over iterations.
+    """
+    # 1. Merge data
+    merged_df = merge_data(path)
+    if merged_df.empty:
+        print("No data found in path:", path)
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Set categorical order
+    if 'Model' in merged_df.columns:
+        # Get all unique models and order them
+        all_models = merged_df['Model'].unique()
+        merged_df['Model'] = pd.Categorical(merged_df['Model'], categories=sorted(all_models), ordered=True)
+    if 'Model_ret' in merged_df.columns:
+        all_ret_models = merged_df['Model_ret'].unique()
+        merged_df['Model_ret'] = pd.Categorical(merged_df['Model_ret'], categories=sorted(all_ret_models), ordered=True)
+
+    # Stage 1: Analysis for each iteration
+    group_by_stage1 = group_by_cols + ['Iteration']
+    summary_stage1_numeric = create_summary_table(merged_df, group_by_stage1, analysis_vars_dict, price_dict, return_numeric=True)
+
+    # Stage 2: Aggregate over iterations
+    agg_funcs = {}
+    for var in analysis_vars_dict:
+        mean_col = f'mean_{var}'
+        agg_funcs[f'mean_{var}'] = (mean_col, 'mean')
+        agg_funcs[f'ci_{var}'] = (mean_col, lambda s, v=var: mean_confidence_interval(s, non_negative=(v in ['Latency', 'Price'])))
+    
+    summary_stage2 = summary_stage1_numeric.groupby(group_by_cols, observed=True).agg(**agg_funcs)
+
+    # Format stage 2 output
+    for var in analysis_vars_dict:
+        mean_col = f'mean_{var}'
+        ci_col = f'ci_{var}'
+        
+        summary_stage2[f'ci_low_{var}'], summary_stage2[f'ci_upp_{var}'] = zip(*summary_stage2[ci_col])
+        
+        summary_stage2[var] = summary_stage2[mean_col].round(3).astype(str) + ' [' + summary_stage2[f'ci_low_{var}'].round(3).astype(str) + '-' + summary_stage2[f'ci_upp_{var}'].round(3).astype(str) + ']'
+        
+        summary_stage2 = summary_stage2.drop(columns=[mean_col, ci_col, f'ci_low_{var}', f'ci_upp_{var}'])
+
+    # Also create a formatted version of stage 1 summary for inspection
+    summary_stage1_formatted = summary_stage1_numeric.copy()
+    for var in analysis_vars_dict:
+        mean_col = f'mean_{var}'
+        ci_low_col = f'ci_low_{var}'
+        ci_upp_col = f'ci_upp_{var}'
+        
+        summary_stage1_formatted[var] = summary_stage1_numeric[mean_col].round(3).astype(str) + ' [' + summary_stage1_numeric[ci_low_col].round(3).astype(str) + '-' + summary_stage1_numeric[ci_upp_col].round(3).astype(str) + ']'
+        summary_stage1_formatted = summary_stage1_formatted.drop(columns=[mean_col, ci_low_col, ci_upp_col])
+
+
+    return summary_stage1_formatted, summary_stage2
+
+def run_ci_summary(
+    path,
+    group_by_cols,
+    price_dict=None,
+    top_k=10,
+    model_order=None,
+    retriever_order=None,
+    dataframe=None,
+    precision_label=None,
+):
+    """
+    Parameterized version of the CI analysis from 04_evaluations_CI_05.ipynb.
+
+    Args:
+        path (str): Folder that holds evaluation CSV files.
+        group_by_cols (list[str]): Columns to group by (Iteration is appended automatically).
+        price_dict (dict, optional): Mapping model -> price per 1M tokens (output). Defaults to DEFAULT_PRICE_DICT.
+        top_k (int): Context window size for calculating Precision@k.
+        model_order (list[str], optional): Explicit categorical order for the 'Model' column.
+        retriever_order (list[str], optional): Explicit categorical order for the 'Model_ret' column.
+        dataframe (pd.DataFrame, optional): Pre-loaded evaluations; skips reading from disk when provided.
+        precision_label (str, optional): Display label to use for Precision@k (defaults to f'P@{top_k}').
+
+    Returns:
+        tuple(pd.DataFrame, pd.DataFrame, pd.DataFrame):
+            - per_iteration_summary: stats per run (includes Iteration column)
+            - summary_table: aggregated stats across iterations with formatted CI columns
+            - merged_df: raw merged evaluations
+    """
+    price_dict = price_dict or DEFAULT_PRICE_DICT
+    base_group_cols = list(group_by_cols)
+    if not base_group_cols:
+        raise ValueError("group_by_cols must contain at least one column.")
+    precision_label = precision_label or f'P@{top_k}'
+    metric_specs = build_ci_metric_specs(precision_label)
+
+    if dataframe is not None:
+        merged_df = dataframe.copy()
+    else:
+        merged_df = merge_data(path)
+    if merged_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), merged_df
+    if 'Iteration' not in merged_df.columns:
+        raise ValueError("Merged evaluations must include an 'Iteration' column.")
+
+    if 'Model' in merged_df.columns:
+        if model_order:
+            merged_df['Model'] = pd.Categorical(merged_df['Model'], categories=model_order, ordered=True)
+        else:
+            merged_df['Model'] = pd.Categorical(
+                merged_df['Model'], categories=sorted(merged_df['Model'].unique()), ordered=True
+            )
+    if 'Model_ret' in merged_df.columns:
+        if retriever_order:
+            merged_df['Model_ret'] = pd.Categorical(
+                merged_df['Model_ret'], categories=retriever_order, ordered=True
+            )
+        else:
+            merged_df['Model_ret'] = pd.Categorical(
+                merged_df['Model_ret'], categories=sorted(merged_df['Model_ret'].unique()), ordered=True
+            )
+
+    merged_df['Throughput'] = calculate_throughput(merged_df)
+    merged_df['Cost'] = calculate_cost(merged_df, price_dict)
+    merged_df[precision_label] = merged_df.apply(
+        lambda row: calculate_precision_at_k(row, top_k=top_k), axis=1
+    )
+
+    iteration_group_cols = list(dict.fromkeys(base_group_cols + ['Iteration']))
+    per_iteration_summary = merged_df.groupby(iteration_group_cols, observed=True).agg(
+        mean_cor_answer=('Cor_answer', 'mean'),
+        mean_elapsed=('Elapsed', 'mean'),
+        mean_tokens=('Total_tokens', 'mean'),
+        mean_precision=(precision_label, 'mean'),
+        mean_throughput=('Throughput', 'mean'),
+        sum_cost=('Cost', 'sum'),
+        sum_cor_answ=('Cor_answer', 'sum'),
+    )
+    per_iteration_summary['price_per_cost'] = np.where(
+        per_iteration_summary['sum_cor_answ'] > 0,
+        per_iteration_summary['sum_cost'] * 100 / per_iteration_summary['sum_cor_answ'],
+        np.nan,
+    )
+    per_iteration_summary = per_iteration_summary.reset_index()
+
+    agg_funcs = {}
+    for spec in metric_specs:
+        agg_funcs[spec['mean_col']] = (spec['source_col'], 'mean')
+        agg_funcs[spec['ci_col']] = (spec['source_col'], spec['ci_func'])
+
+    summary_table = per_iteration_summary.groupby(base_group_cols, observed=True).agg(**agg_funcs).reset_index()
+
+    for spec in metric_specs:
+        ci_low_col = f'ci_low_{spec["display"]}'
+        ci_upp_col = f'ci_upp_{spec["display"]}'
+        summary_table = _attach_ci_bounds(summary_table, spec['ci_col'], ci_low_col, ci_upp_col)
+        if summary_table.empty:
+            summary_table[spec['display']] = pd.Series(dtype=object)
+        else:
+            summary_table[spec['display']] = summary_table.apply(
+                lambda row, m=spec['mean_col'], low=ci_low_col, upp=ci_upp_col, dec=spec.get('decimals', 3): _format_ci_cell(
+                    row[m], row[low], row[upp], decimals=dec
+                ),
+                axis=1,
+            )
+        drop_cols = [col for col in (spec['mean_col'], ci_low_col, ci_upp_col) if col in summary_table.columns]
+        if drop_cols:
+            summary_table = summary_table.drop(columns=drop_cols)
+
+    per_iteration_display = per_iteration_summary.rename(
+        columns={
+            'mean_cor_answer': 'Cor_answer',
+            'mean_elapsed': 'Elapsed',
+            'mean_tokens': 'Total_tokens',
+            'mean_precision': precision_label,
+            'mean_throughput': 'Throughput',
+            'sum_cost': 'Cost',
+            'sum_cor_answ': 'Correct_answers',
+            'price_per_cost': 'Price-per-cost',
+        }
+    )
+
+    return per_iteration_display, summary_table, merged_df
