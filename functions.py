@@ -929,9 +929,9 @@ def retrieve_colpali (query, processor, model, qdrant_client, username, colectio
     return query_result
 
 
-from langchain.schema.retriever import BaseRetriever
+#from langchain.schema.retriever import BaseRetriever
 from typing import TYPE_CHECKING, Any, Dict, List, Optional 
-from langchain.callbacks.manager import CallbackManagerForRetrieverRun
+#from langchain.callbacks.manager import CallbackManagerForRetrieverRun
 
 from langchain_core.retrievers import BaseRetriever
 #from langchain_core.pydantic_v1 import Field

@@ -6,9 +6,8 @@ authors = [
     {name = "pkocbek",email = "primoz.kocbek@um.si"}
 ]
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<4.0.0"
 dependencies = [
-    "colpali-engine @ git+https://github.com/AhmedMasryKU/colflor.git",
     "ipykernel (>=6.30.1,<7.0.0)",
     "tqdm (>=4.67.1,<5.0.0)",
     "einops (>=0.8.1,<0.9.0)",
@@ -21,10 +20,24 @@ dependencies = [
     "openai (>=2.0.0,<3.0.0)",
     "pandas (>=2.3.3,<3.0.0)",
     "openpyxl (>=3.1.5,<4.0.0)",
-    "nest-asyncio (>=1.6.0,<2.0.0)"
+    "nest-asyncio (>=1.6.0,<2.0.0)",
+    "docling (>=2.62.0,<3.0.0)",
+    "langchain-core (>=1.0.5,<2.0.0)",
+    "stamina (>=25.1.0,<26.0.0)",
+    "qdrant-client (>=1.16.0,<2.0.0)",
+    "colpali-engine (>=0.3.13,<0.4.0)",
+    "langchain-qdrant (>=1.1.0,<2.0.0)",
+    "langchain-community (>=0.4.1,<0.5.0)",
+    "langchain (>=1.0.7,<2.0.0)",
+    "statsmodels (>=0.14.5,<0.15.0)",
+    "langchain-huggingface (>=1.0.1,<2.0.0)",
+    "onnxruntime (>=1.23.2,<2.0.0)"
 ]
 
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+package-mode = false
