@@ -43,8 +43,8 @@ multi-modal_colpali/
 
 1. **Create a Python environment**
    ```bash
-   pyenv install 3.12.3   # or your preferred 3.12 build
-   pyenv virtualenv 3.12.3 mm-colpali
+   pyenv install 3.12.12   # or your preferred 3.12 build
+   pyenv virtualenv 3.12.12 mm-colpali
    pyenv local mm-colpali
    pip install --upgrade pip
    pip install poetry

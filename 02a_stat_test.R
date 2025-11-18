@@ -5,7 +5,7 @@
 
 rm(list=ls())
 # Packages
-for (n in c('dplyr','tidyr', 'data.table', 'purr')) {
+for (n in c('dplyr','tidyr', 'data.table')) {
   if(!require(n,character.only=TRUE)) { 
     install.packages(n)
   }
