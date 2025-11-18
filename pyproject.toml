@@ -31,7 +31,8 @@ dependencies = [
     "langchain (>=1.0.7,<2.0.0)",
     "statsmodels (>=0.14.5,<0.15.0)",
     "langchain-huggingface (>=1.0.1,<2.0.0)",
-    "onnxruntime (>=1.23.2,<2.0.0)"
+    "onnxruntime (>=1.23.2,<2.0.0)",
+    "sentence-transformers (>=5.1.2,<6.0.0)"
 ]
 
 
