@@ -1,4 +1,4 @@
-# Multi-Modal ColPali Experiments
+# Multi-Modal RAG BioMed Experiments
 
 End-to-end workflows for building multi-modal vector stores and evaluating large
 vision-language models on the Glycan multiple-choice benchmark. The repository
@@ -17,7 +17,7 @@ setup to new domains.
 ## 1. Repository Layout & Required Assets
 
 ```
-multi-modal_colpali/
+multi-modal-RAG-biomed/
 ├── 00_run_docker_containers.sh            # Infrastructure bootstrap
 ├── 01_create_context_qdrant.py            # Context creation pipeline
 ├── 02_experiment01.py                     # Async evaluation driver
